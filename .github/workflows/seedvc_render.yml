@@ -13,112 +13,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      - uses: actions/checkout@v4
+      - name: Install client
+        run: python -m pip install -q --upgrade gradio_client
 
-      - name: Restore private key cache
-        id: keycache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/seedvc_private.pem
-          key: seedvc-transport-key-v1
-
-      - name: Create transport key if absent
-        if: steps.keycache.outputs.cache-hit != 'true'
-        run: |
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/seedvc_private.pem
-          openssl pkey -in /tmp/seedvc_private.pem -pubout -out /tmp/seedvc_public.pem
-
-      - name: Recreate public key from cached private key
-        if: steps.keycache.outputs.cache-hit == 'true'
-        run: openssl pkey -in /tmp/seedvc_private.pem -pubout -out /tmp/seedvc_public.pem
-
-      - name: Upload public transport key
-        uses: actions/upload-artifact@v4
-        with:
-          name: seedvc-public-key
-          path: /tmp/seedvc_public.pem
-          overwrite: true
-
-      - name: Check render payload
-        id: payload
-        shell: bash
-        run: |
-          if [[ -f encrypted/source.bin && -f encrypted/reference.bin && -f encrypted/key.bin ]]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Render final vocal
-        if: steps.payload.outputs.ready == 'true'
+      - name: Download source and reference
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -q --upgrade gradio_client cryptography
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          curl -L --fail --retry 3 -o source.wav 'https://cdn-editing-temp.picsart.com/editing-temp/00c35986-42cc-472c-8fd7-9442cd7d2593.x-wav'
+          curl -L --fail --retry 3 -o reference.wav 'https://cdn-editing-temp.picsart.com/editing-temp/9d41e4e1-4c80-471a-9b2a-9bc11304941b.x-wav'
+          ls -lh source.wav reference.wav
+
+      - name: Convert Slayyyter performance to Mikhail voice
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
-          from pathlib import Path
-          import subprocess, os
-          from cryptography.hazmat.primitives import serialization, hashes
-          from cryptography.hazmat.primitives.asymmetric import padding
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          import os, shutil
           from gradio_client import Client, handle_file
 
-          priv = serialization.load_pem_private_key(Path('/tmp/seedvc_private.pem').read_bytes(), password=None)
-          aes_key = priv.decrypt(Path('encrypted/key.bin').read_bytes(), padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
-          aes = AESGCM(aes_key)
-
-          def decrypt(src, dst, aad):
-              raw = Path(src).read_bytes()
-              nonce, ct = raw[:12], raw[12:]
-              Path(dst).write_bytes(aes.decrypt(nonce, ct, aad))
-
-          decrypt('encrypted/source.bin', '/tmp/source.opus', b'source')
-          decrypt('encrypted/reference.bin', '/tmp/reference.opus', b'reference')
-          subprocess.run(['ffmpeg','-y','-loglevel','error','-i','/tmp/source.opus','-ac','1','-ar','44100','/tmp/source.wav'], check=True)
-          subprocess.run(['ffmpeg','-y','-loglevel','error','-i','/tmp/reference.opus','-ac','1','-ar','44100','/tmp/reference.wav'], check=True)
-
           client = Client('Plachta/Seed-VC', verbose=True)
-          print(client.view_api(all_endpoints=True, print_info=False))
+          info = client.view_api(return_format='dict', all_endpoints=True, print_info=False)
+          print(info)
+
+          named = info.get('named_endpoints', {}) if isinstance(info, dict) else {}
+          candidates = []
+          for api_name, spec in named.items():
+              params = spec.get('parameters', []) if isinstance(spec, dict) else []
+              print('ENDPOINT', api_name, 'PARAMS', len(params))
+              if len(params) == 8:
+                  candidates.append(api_name)
+          for fallback in ['/predict_1', '/predict', '/voice_conversion', '/predict_2']:
+              if fallback not in candidates:
+                  candidates.append(fallback)
+
           result = None
           errors = []
-          for api_name in ['/predict_1', '/predict', '/voice_conversion', '/predict_2']:
+          for api_name in candidates:
               try:
+                  print('TRYING', api_name)
                   result = client.predict(
-                      handle_file('/tmp/source.wav'),
-                      handle_file('/tmp/reference.wav'),
-                      30,
+                      handle_file('source.wav'),
+                      handle_file('reference.wav'),
+                      40,
                       1.0,
                       0.7,
                       True,
-                      True,
+                      False,
                       0,
                       api_name=api_name,
                   )
-                  print('SUCCESS endpoint', api_name, 'result=', result)
+                  print('SUCCESS', api_name, result)
                   break
               except Exception as e:
                   errors.append((api_name, repr(e)))
                   print('FAILED', api_name, repr(e))
           if result is None:
-              raise RuntimeError(f'All Seed-VC endpoints failed: {errors}')
+              raise RuntimeError(f'No working V1 SVC endpoint: {errors}')
 
-          candidates = result if isinstance(result, (list, tuple)) else [result]
-          out_path = None
-          for item in reversed(candidates):
+          items = result if isinstance(result, (tuple, list)) else [result]
+          out = None
+          for item in reversed(items):
               p = item.get('path') if isinstance(item, dict) else item
-              if isinstance(p, str) and os.path.exists(p):
-                  out_path = p
+              if isinstance(p, str) and os.path.isfile(p):
+                  out = p
                   break
-          if not out_path:
-              raise RuntimeError(f'Could not locate returned audio: {result!r}')
-
-          subprocess.run(['ffmpeg','-y','-loglevel','error','-i',out_path,'-c:a','pcm_s24le','-ar','44100','-ac','1','MIKHAIL_SLAYYYTER_FINAL_SVC.wav'], check=True)
+          if not out:
+              raise RuntimeError(f'Full WAV not found in result: {result!r}')
+          shutil.copy2(out, 'MIKHAIL_SLAYYYTER_FINAL_SVC.wav')
+          print('FINAL', os.path.getsize('MIKHAIL_SLAYYYTER_FINAL_SVC.wav'))
           PY
 
-      - name: Upload final vocal
-        if: steps.payload.outputs.ready == 'true'
+      - name: Upload final WAV
         uses: actions/upload-artifact@v4
         with:
           name: MIKHAIL-SLAYYYTER-FINAL-SVC
