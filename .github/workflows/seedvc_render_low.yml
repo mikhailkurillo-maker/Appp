@@ -1,0 +1,73 @@
+name: SeedVC Render Low
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Install client
+        run: |
+          python -m pip install -q --upgrade gradio_client
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Download source and reference
+        run: |
+          curl -L --fail --retry 3 'https://cdn-editing-temp.picsart.com/editing-temp/c257a62a-0cab-44a2-b7d0-bedec6692e6c.x-wav' -o source.wav
+          curl -L --fail --retry 3 'https://cdn-editing-temp.picsart.com/editing-temp/b08da805-4ed6-4cbb-b0fe-4c48ce26ac0d.x-wav' -o reference.wav
+
+      - name: Convert Slayyyter performance to Mikhail voice at male register
+        run: |
+          python - <<'PY'
+          from gradio_client import Client, handle_file
+          import os, subprocess
+          client = Client('Plachta/Seed-VC', verbose=True)
+          result = None
+          errors=[]
+          for api_name in ['/predict_1','/predict','/voice_conversion','/predict_2']:
+              try:
+                  result = client.predict(
+                      handle_file('source.wav'),
+                      handle_file('reference.wav'),
+                      40,
+                      1.0,
+                      0.7,
+                      True,
+                      False,
+                      -12,
+                      api_name=api_name,
+                  )
+                  print('SUCCESS', api_name, result)
+                  break
+              except Exception as e:
+                  print('FAILED', api_name, repr(e))
+                  errors.append((api_name, repr(e)))
+          if result is None:
+              raise RuntimeError(errors)
+          candidates = result if isinstance(result, (list, tuple)) else [result]
+          out_path=None
+          for item in reversed(candidates):
+              p=item.get('path') if isinstance(item, dict) else item
+              if isinstance(p,str) and os.path.exists(p):
+                  out_path=p
+                  break
+          if not out_path:
+              raise RuntimeError(f'No output path: {result!r}')
+          subprocess.run(['ffmpeg','-y','-loglevel','error','-i',out_path,'-c:a','pcm_s24le','-ar','44100','-ac','1','MIKHAIL_SLAYYYTER_FINAL_SVC_LOW.wav'],check=True)
+          PY
+
+      - name: Upload final WAV
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIKHAIL-SLAYYYTER-FINAL-SVC-LOW
+          path: MIKHAIL_SLAYYYTER_FINAL_SVC_LOW.wav
+          compression-level: 0
+          if-no-files-found: error
