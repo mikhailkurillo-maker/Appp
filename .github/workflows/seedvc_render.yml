@@ -1,0 +1,127 @@
+name: SeedVC Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore private key cache
+        id: keycache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/seedvc_private.pem
+          key: seedvc-transport-key-v1
+
+      - name: Create transport key if absent
+        if: steps.keycache.outputs.cache-hit != 'true'
+        run: |
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/seedvc_private.pem
+          openssl pkey -in /tmp/seedvc_private.pem -pubout -out /tmp/seedvc_public.pem
+
+      - name: Recreate public key from cached private key
+        if: steps.keycache.outputs.cache-hit == 'true'
+        run: openssl pkey -in /tmp/seedvc_private.pem -pubout -out /tmp/seedvc_public.pem
+
+      - name: Upload public transport key
+        uses: actions/upload-artifact@v4
+        with:
+          name: seedvc-public-key
+          path: /tmp/seedvc_public.pem
+          overwrite: true
+
+      - name: Check render payload
+        id: payload
+        shell: bash
+        run: |
+          if [[ -f encrypted/source.bin && -f encrypted/reference.bin && -f encrypted/key.bin ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render final vocal
+        if: steps.payload.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q --upgrade gradio_client cryptography
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, os
+          from cryptography.hazmat.primitives import serialization, hashes
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          from gradio_client import Client, handle_file
+
+          priv = serialization.load_pem_private_key(Path('/tmp/seedvc_private.pem').read_bytes(), password=None)
+          aes_key = priv.decrypt(Path('encrypted/key.bin').read_bytes(), padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+          aes = AESGCM(aes_key)
+
+          def decrypt(src, dst, aad):
+              raw = Path(src).read_bytes()
+              nonce, ct = raw[:12], raw[12:]
+              Path(dst).write_bytes(aes.decrypt(nonce, ct, aad))
+
+          decrypt('encrypted/source.bin', '/tmp/source.opus', b'source')
+          decrypt('encrypted/reference.bin', '/tmp/reference.opus', b'reference')
+          subprocess.run(['ffmpeg','-y','-loglevel','error','-i','/tmp/source.opus','-ac','1','-ar','44100','/tmp/source.wav'], check=True)
+          subprocess.run(['ffmpeg','-y','-loglevel','error','-i','/tmp/reference.opus','-ac','1','-ar','44100','/tmp/reference.wav'], check=True)
+
+          client = Client('Plachta/Seed-VC', verbose=True)
+          print(client.view_api(all_endpoints=True, print_info=False))
+          result = None
+          errors = []
+          for api_name in ['/predict_1', '/predict', '/voice_conversion', '/predict_2']:
+              try:
+                  result = client.predict(
+                      handle_file('/tmp/source.wav'),
+                      handle_file('/tmp/reference.wav'),
+                      30,
+                      1.0,
+                      0.7,
+                      True,
+                      True,
+                      0,
+                      api_name=api_name,
+                  )
+                  print('SUCCESS endpoint', api_name, 'result=', result)
+                  break
+              except Exception as e:
+                  errors.append((api_name, repr(e)))
+                  print('FAILED', api_name, repr(e))
+          if result is None:
+              raise RuntimeError(f'All Seed-VC endpoints failed: {errors}')
+
+          candidates = result if isinstance(result, (list, tuple)) else [result]
+          out_path = None
+          for item in reversed(candidates):
+              p = item.get('path') if isinstance(item, dict) else item
+              if isinstance(p, str) and os.path.exists(p):
+                  out_path = p
+                  break
+          if not out_path:
+              raise RuntimeError(f'Could not locate returned audio: {result!r}')
+
+          subprocess.run(['ffmpeg','-y','-loglevel','error','-i',out_path,'-c:a','pcm_s24le','-ar','44100','-ac','1','MIKHAIL_SLAYYYTER_FINAL_SVC.wav'], check=True)
+          PY
+
+      - name: Upload final vocal
+        if: steps.payload.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIKHAIL-SLAYYYTER-FINAL-SVC
+          path: MIKHAIL_SLAYYYTER_FINAL_SVC.wav
+          compression-level: 0
+          if-no-files-found: error
